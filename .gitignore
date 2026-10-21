@@ -1,0 +1,3 @@
+# Build output (published as a GitHub Release asset instead)
+*.exe
+*.pdb
