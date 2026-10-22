@@ -2,7 +2,7 @@
 
 轻量的 Office 文档标签栏：把 **Microsoft Word / Excel** 的多个窗口当作“一个窗口的多个标签”来切换，体验接近 WPS 的标签页。
 
-*A lightweight WPS-style tab bar that groups Microsoft Word and Excel windows into one tabbed window. Single ~30 KB exe, ~22 MB RAM, no install, no SDK needed to build.*
+*A lightweight WPS-style tab bar that groups Microsoft Word and Excel windows into one tabbed window. Single ~45 KB exe that also registers itself as an Office COM add-in so it starts with Word / Excel, ~22 MB RAM, no install, no SDK needed to build.*
 
 ## 功能
 
@@ -10,6 +10,8 @@
 - **最大化时**：标签栏固定在屏幕顶部，最大化的文档窗口自动下移让出位置，标签与标题栏无缝贴合；其他程序（浏览器等）最大化时不受影响。
 - **小窗口时**：标签贴在窗口标题栏正上方，随窗口移动；窗口顶到屏幕上沿放不下时自动隐藏，鼠标停在窗口上沿约 0.2 秒滑出。
 - **整组联动**：一个文档最大化 / 还原 / 移动 / 缩放 / 最小化，其他文档同步为相同状态和位置。拖动窗口时其他文档暂时隐藏，松手后出现在同一位置。
+- **拖标签栏移动窗口**：按住标签往上 / 下拖，或按住标签栏空白处拖动，整个窗口跟着走；最大化时往下拖会还原窗口，拖到屏幕上沿松手则最大化。水平拖动标签仍是调整顺序。双击标签栏空白处最大化 / 还原。
+- **随 Office 自动启动**：DocTabs 同时是一个 Office COM 插件，打开 Word 或 Excel 时自动启动标签栏，Office 全部关闭后自动退出，不用常驻后台。
 - **关闭**
   - 标签上的 × 或中键：只关闭该文档
   - 窗口右上角 × 或 Alt+F4：整组文档依次关闭（未保存的会逐个弹出保存提示，点“取消”即停止）
@@ -22,9 +24,12 @@
 ## 下载与使用
 
 1. 在 [Releases](https://github.com/stevensijd-qgg/DocTabs/releases) 下载 `DocTabs.exe`，放到任意文件夹。
-2. 双击运行。打开 Word 或 Excel 文档后，标签栏会自动出现。
-3. 如需开机自启动：右键任务栏托盘里的 DocTabs 图标 → 勾选“开机自启动”。
-4. 退出：右键托盘图标 → 退出（会把调整过的窗口恢复原状）。
+2. 双击运行一次。打开 Word 或 Excel 文档后，标签栏会自动出现。
+3. 第一次运行时会自动登记为 Office 插件（只写当前用户的注册表，不需要管理员权限），以后直接打开 Word / Excel 就会自动带起 DocTabs。可在托盘菜单里取消“打开 Word / Excel 时自动启动”。
+4. 也可以改用开机自启动：右键托盘图标 → 勾选“开机自启动”。
+5. 退出：右键托盘图标 → 退出（会把调整过的窗口恢复原状）。
+
+> 想挪动 `DocTabs.exe` 的位置：挪完后运行一次即可，插件登记会自动更新。想删除它：先在托盘菜单里取消“打开 Word / Excel 时自动启动”。插件也会出现在 Office 的“文件 → 选项 → 加载项 → COM 加载项”里，名称是“DocTabs 文档标签栏”。
 
 > 程序未做数字签名，首次运行时 Windows SmartScreen 可能提示“未知发布者”，点“更多信息 → 仍要运行”即可。也可以按下面的方法自己从源码编译。
 
@@ -38,7 +43,7 @@
 build.bat
 ```
 
-会在同目录生成 `DocTabs.exe`。修改源码前请先在托盘里退出正在运行的 DocTabs，否则 exe 被占用无法覆盖。
+会在同目录生成 `DocTabs.exe`。重新编译前请先在托盘里退出正在运行的 DocTabs；Word / Excel 开着时 exe 也会被 Office 插件占用，可以先关掉 Office，或者把旧的 exe 改个名字再编译。
 
 源码只有一个文件 [`DocTabs.cs`](DocTabs.cs)（C# 5 / WinForms）。
 
@@ -49,6 +54,9 @@ build.bat
 - 标签栏是 `WS_EX_NOACTIVATE` 的工具窗口，点击不会抢走焦点；文档在前台时置顶，切到其他程序时只紧贴在文档窗口上一层。
 - 浮动模式下标签以外的区域用 `TransparencyKey` 透明，可以点穿。
 - 整组关闭通过低级鼠标/键盘钩子只识别“在当前文档的关闭按钮上松开左键”和“Alt+F4”两个动作，不记录其他输入。
+- Office 插件：`DocTabs.exe` 里有一个实现 `IDTExtensibility2` 的 COM 类，登记在 `HKCU\Software\Classes\CLSID` 和 `HKCU\Software\Microsoft\Office\{Word,Excel}\Addins` 下。Office 加载它时只检查 DocTabs 是否在运行，没在运行就以 `/office` 参数启动，此后不再做任何事；以 `/office` 启动的 DocTabs 在 Word / Excel 进程全部退出几秒后自动退出。
+- 逐显示器 DPI 感知（Per-Monitor V2）：主副屏缩放不同时，所有窗口坐标都是真实像素，标签栏高度和字体随文档所在屏幕的缩放变化。
+- 拖动标签栏移动窗口：标签栏从不激活，鼠标一离开它就收不到鼠标消息，所以按住期间用 10ms 定时器轮询鼠标位置和按键状态，异步下发窗口位置。
 
 ## 已知限制
 
