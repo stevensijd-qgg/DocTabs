@@ -2,7 +2,7 @@
 
 轻量的 Office 文档标签栏：把 **Microsoft Word / Excel** 的多个窗口当作“一个窗口的多个标签”来切换，体验接近 WPS 的标签页。
 
-*A lightweight WPS-style tab bar that groups Microsoft Word and Excel windows into one tabbed window. Single ~45 KB exe that also registers itself as an Office COM add-in so it starts with Word / Excel, ~22 MB RAM, no install, no SDK needed to build.*
+*A lightweight WPS-style tab bar that groups Microsoft Word and Excel windows into one tabbed window. Single ~50 KB exe that also registers itself as an Office COM add-in so it starts with Word / Excel, ~22 MB RAM, no install, no SDK needed to build.*
 
 ## 功能
 

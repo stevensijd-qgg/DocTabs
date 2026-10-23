@@ -24,8 +24,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyProduct("DocTabs")]
 [assembly: System.Reflection.AssemblyDescription("Lightweight WPS-style tab bar for Microsoft Word and Excel windows")]
 [assembly: System.Reflection.AssemblyCopyright("Copyright (c) 2026 stevensijd-qgg, MIT License")]
-[assembly: System.Reflection.AssemblyVersion("1.5.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.5.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.5.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.5.1.0")]
 [assembly: ComVisible(false)]
 
 namespace DocTabs
@@ -251,6 +251,13 @@ namespace DocTabs
         public readonly HashSet<IntPtr> HiddenByUs = new HashSet<IntPtr>();
         public TabBar DragGroup;
         DateTime dragStart;
+        // 从标签栏开始的拖动：被拖的窗口、松手后要切到前台的窗口、是否由我们自己跟着鼠标挪
+        IntPtr moveWin, activateAfterMove;
+        bool movePosted, selfMove, moveSeen, moveBtnUp;
+        int movePosts;
+        Point selfMoveOffset, lastSelfPos;
+        DateTime moveStarted, moveReleased, lastMovePost;
+        readonly System.Windows.Forms.Timer moveWatch;
 
         // 用户点了某个文档窗口的 ×（或按了 Alt+F4）：该窗口真正关掉后，它所在的整组一起关闭
         IntPtr closeIntent;
@@ -299,6 +306,8 @@ namespace DocTabs
             // 松手后稍等当前文档的最终位置稳定，再把其他文档放到同一位置并显示出来
             revealTimer = new System.Windows.Forms.Timer { Interval = 80 };
             revealTimer.Tick += delegate { revealTimer.Stop(); RevealHidden(); };
+            moveWatch = new System.Windows.Forms.Timer { Interval = 10 };
+            moveWatch.Tick += delegate { MoveWatchTick(); };
 
             enumProc = EnumCallback;
             winEventProc = OnWinEvent;
@@ -398,13 +407,135 @@ namespace DocTabs
                 if (g != src && g.Visible && g.TabStripContains(c)) { Merge(src, g); return; }
         }
 
-        // 交给系统的拖动流程移动窗口（与拖标题栏完全相同：流畅、可贴边分屏）。调用时左键必须仍按着
+        // 交给系统的拖动流程移动窗口（与拖标题栏完全相同：流畅、可贴边分屏）。调用时左键必须仍按着。
+        // 按着鼠标时不能把窗口切到前台：Office 会等到松手才开始处理拖动，窗口就在松手后一直粘着鼠标。
+        // 所以只把窗口提到最上面，松手后再切到前台。前台是另一个程序（线程）时系统的拖动拿不到鼠标，
+        // 系统的拖动迟迟没开始时也一样，改由我们自己跟着鼠标挪
         public void StartNativeMove(IntPtr h)
         {
             Native.ReleaseCapture();
             Point c = Cursor.Position;
-            Native.PostMessage(h, Native.WM_SYSCOMMAND, (IntPtr)(Native.SC_MOVE | Native.HTCAPTION),
-                (IntPtr)((c.Y << 16) | (c.X & 0xFFFF)));
+            IntPtr fg = Native.GetForegroundWindow();
+            if (fg != h)
+            {
+                Native.SetWindowPos(h, Native.HWND_TOP, 0, 0, 0, 0, Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+                activateAfterMove = h;
+            }
+            Native.RECT r;
+            Native.GetWindowRect(h, out r);
+            selfMoveOffset = new Point(r.Left - c.X, r.Top - c.Y);
+            lastSelfPos = new Point(r.Left, r.Top);
+            moveWin = h;
+            moveSeen = false;
+            moveBtnUp = false;
+            selfMove = false;
+            movePosts = 0;
+            moveStarted = DateTime.Now;
+            movePosted = fg == h || ThreadOf(fg) == ThreadOf(h);
+            if (movePosted)
+                Native.PostMessage(h, Native.WM_SYSCOMMAND, (IntPtr)(Native.SC_MOVE | Native.HTCAPTION),
+                    (IntPtr)((c.Y << 16) | (c.X & 0xFFFF)));
+            else StartSelfMove(h);
+            moveWatch.Start();
+        }
+
+        void StartSelfMove(IntPtr h)
+        {
+            selfMove = true;
+            var g = GroupOf(h);
+            if (g != null && g.CurDoc == h && DragGroup != g) BeginWindowDrag(g);
+        }
+
+        static uint ThreadOf(IntPtr h)
+        {
+            uint pid;
+            return h == IntPtr.Zero ? 0 : Native.GetWindowThreadProcessId(h, out pid);
+        }
+
+        // 窗口 h 是否正处在系统的拖动/缩放流程里
+        static bool InMoveLoop(IntPtr h)
+        {
+            var gi = new Native.GUITHREADINFO { cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO)) };
+            return Native.GetGUIThreadInfo(ThreadOf(h), ref gi) && (gi.flags & Native.GUI_INMOVESIZE) != 0 && gi.hwndMoveSize == h;
+        }
+
+        // 结束窗口 h 上多余的系统拖动：先补发松开左键，不行再按回车（窗口停在当前位置）
+        void EndMoveLoop(IntPtr h)
+        {
+            if ((DateTime.Now - lastMovePost).TotalMilliseconds < 150) return;
+            lastMovePost = DateTime.Now;
+            bool hard = movePosts++ >= 2;
+            Native.PostMessage(h, hard ? Native.WM_KEYDOWN : Native.WM_LBUTTONUP,
+                hard ? (IntPtr)Native.VK_RETURN : IntPtr.Zero, IntPtr.Zero);
+        }
+
+        // 拖动期间每 10ms 一次：自己挪窗口时跟着鼠标走；松手后系统的拖动若还没结束（窗口会一直粘着鼠标），替它结束
+        void MoveWatchTick()
+        {
+            IntPtr h = moveWin;
+            if (h == IntPtr.Zero || !Native.IsWindow(h)) { StopMoveWatch(); return; }
+            int vk = SystemInformation.MouseButtonsSwapped ? Native.VK_RBUTTON : Native.VK_LBUTTON;
+            bool down = (Native.GetAsyncKeyState(vk) & 0x8000) != 0;
+            bool inLoop = movePosted && InMoveLoop(h);
+            if (down && !moveBtnUp)
+            {
+                if (selfMove)
+                {
+                    // 系统的拖动迟到了，而我们已经在挪：结束它
+                    if (inLoop) { moveSeen = true; EndMoveLoop(h); }
+                    Point c = Cursor.Position;
+                    var p = new Point(c.X + selfMoveOffset.X, c.Y + selfMoveOffset.Y);
+                    if (p != lastSelfPos)
+                    {
+                        lastSelfPos = p;
+                        Native.SetWindowPos(h, IntPtr.Zero, p.X, p.Y, 0, 0,
+                            Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_ASYNCWINDOWPOS);
+                    }
+                }
+                else if (inLoop) moveSeen = true;
+                else if (!moveSeen && (DateTime.Now - moveStarted).TotalMilliseconds > 150) StartSelfMove(h);
+                return;
+            }
+            // 松手后又按下：用户开始了新的操作，不再管
+            if (down) { StopMoveWatch(); return; }
+            if (!moveBtnUp)
+            {
+                moveBtnUp = true;
+                moveReleased = DateTime.Now;
+                if (selfMove)
+                {
+                    selfMove = false;
+                    if (DragGroup != null) EndWindowDrag();
+                    else TryMergeOnDrop(GroupOf(h));
+                    ActivateAfterMove();
+                }
+            }
+            double ms = (DateTime.Now - moveReleased).TotalMilliseconds;
+            if (inLoop)
+            {
+                moveSeen = true;
+                if (ms > 80) EndMoveLoop(h);
+                return;
+            }
+            // 系统的拖动已经结束；或者还没开始——再等一会儿，防止它在松手后才开始
+            if (moveSeen || !movePosted || ms > 2000) StopMoveWatch();
+        }
+
+        void StopMoveWatch()
+        {
+            moveWatch.Stop();
+            moveWin = IntPtr.Zero;
+            selfMove = false;
+            ActivateAfterMove();
+        }
+
+        // 拖完了：把被拖的窗口切到前台
+        void ActivateAfterMove()
+        {
+            IntPtr h = activateAfterMove;
+            activateAfterMove = IntPtr.Zero;
+            if (h == IntPtr.Zero || !Native.IsWindow(h) || Native.IsIconic(h) || Native.GetForegroundWindow() == h) return;
+            BringToFront(h);
         }
 
         // 把窗口切到前台（绕过系统的前台锁）
@@ -639,7 +770,8 @@ namespace DocTabs
                     if (g != null && hwnd == g.CurDoc) BeginWindowDrag(g);
                     return;
                 case Native.EVENT_SYSTEM_MOVESIZEEND:
-                    if (DragGroup != null) EndWindowDrag();
+                    // 我们自己挪窗口时，迟到的系统拖动被结束掉不算松手
+                    if (DragGroup != null && !selfMove) EndWindowDrag();
                     return;
                 case Native.EVENT_OBJECT_LOCATIONCHANGE:
                     g = GroupOf(hwnd);
@@ -966,6 +1098,7 @@ namespace DocTabs
             fallbackTimer.Stop();
             scanTimer.Stop();
             revealTimer.Stop();
+            moveWatch.Stop();
             foreach (var h in hooks) if (h != IntPtr.Zero) Native.UnhookWinEvent(h);
             if (mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHook);
             if (keyHook != IntPtr.Zero) Native.UnhookWindowsHookEx(keyHook);
@@ -1791,7 +1924,9 @@ namespace DocTabs
             hoverIndex = -1;
             hoverClose = false;
             tip.Hide(this);
-            if (h != CurDoc || Native.GetForegroundWindow() != h) ActivateDoc(h);
+            // 按着鼠标时不切前台（见 StartNativeMove），只更新分组状态，松手后再切
+            if (h != CurDoc) { ApplyGroupState(h, true); CurDoc = h; }
+            mgr.Active = this;
             if (mgr.IsMax(h)) RestoreUnderCursor(h, c, pressScreen.X - Left, pressScreen.Y - Top);
             Invalidate();
             mgr.StartNativeMove(h);
@@ -1858,9 +1993,9 @@ namespace DocTabs
             // 新的标签栏只有一个标签，它的左边距是 6 像素（按缩放）
             int frameLeft = c.X - (int)(6 * s + grabX);
             PlaceNormal(h, ng, frameLeft - side, c.Y - grabY, w, ht, c);
-            Manager.BringToFront(h);
-            ng.UpdatePlacement();
+            // 不在这里切前台（见 StartNativeMove），松手后再切
             mgr.StartNativeMove(h);
+            ng.UpdatePlacement();
         }
 
         // 右键菜单“拆分为单独窗口”：在原窗口旁边错开一点放
@@ -1969,6 +2104,18 @@ namespace DocTabs
 
         [StructLayout(LayoutKind.Sequential)]
         public struct POINT { public int X, Y; }
+
+        public const int GUI_INMOVESIZE = 2, WM_KEYDOWN = 0x100, VK_RETURN = 0x0D;
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct GUITHREADINFO
+        {
+            public int cbSize, flags;
+            public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+            public RECT rcCaret;
+        }
+
+        [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info);
 
         [StructLayout(LayoutKind.Sequential)]
         public struct WINDOWPLACEMENT
