@@ -24,8 +24,8 @@ using Microsoft.Win32;
 [assembly: System.Reflection.AssemblyProduct("DocTabs")]
 [assembly: System.Reflection.AssemblyDescription("Lightweight WPS-style tab bar for Microsoft Word and Excel windows")]
 [assembly: System.Reflection.AssemblyCopyright("Copyright (c) 2026 stevensijd-qgg, MIT License")]
-[assembly: System.Reflection.AssemblyVersion("1.5.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.5.1.0")]
+[assembly: System.Reflection.AssemblyVersion("1.5.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.5.2.0")]
 [assembly: ComVisible(false)]
 
 namespace DocTabs
@@ -41,6 +41,10 @@ namespace DocTabs
             using (var mutex = new Mutex(true, MutexName, out created))
             {
                 if (!created) return;
+                Log.Write("DocTabs " + Application.ProductVersion + " 启动" + (args.Length > 0 ? " " + string.Join(" ", args) : ""));
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+                Application.ThreadException += (s, e) => Log.Write("出错（已忽略）：" + e.Exception);
+                AppDomain.CurrentDomain.UnhandledException += (s, e) => Log.Write("崩溃：" + e.ExceptionObject);
                 // 逐显示器 DPI 感知：主副屏缩放不同时，取到的窗口坐标才是真实像素，不会被系统按主屏缩放换算
                 bool perMonitor = false;
                 try { perMonitor = Native.SetProcessDpiAwarenessContext(new IntPtr(-4) /* PER_MONITOR_AWARE_V2 */); }
@@ -79,12 +83,14 @@ namespace DocTabs
     {
         public void OnConnection(object application, int connectMode, object addInInst, ref Array custom)
         {
+            Log.Write("Office 插件已加载");
             OfficeAddin.LaunchDocTabs();
             OfficeAddin.StartWatch();
         }
         public void OnDisconnection(int removeMode, ref Array custom) { OfficeAddin.StopWatch(); }
         public void OnAddInsUpdate(ref Array custom) { }
-        public void OnStartupComplete(ref Array custom) { }
+        // Office 完全启动好之后再确认一次（开机时 Office 可能先于桌面就绪启动）
+        public void OnStartupComplete(ref Array custom) { OfficeAddin.LaunchDocTabs(); }
         public void OnBeginShutdown(ref Array custom) { }
     }
 
@@ -100,11 +106,12 @@ namespace DocTabs
 
         static System.Threading.Timer watch;
         static int watchLaunches;
+        static DateTime lastLaunch;
 
         public static void LaunchDocTabs()
         {
-            try { if (!IsRunning()) Start(); }
-            catch { } // 任何问题都不能影响 Office 本身
+            try { if (!IsRunning()) Start("启动 DocTabs"); }
+            catch (Exception ex) { Log.Write("启动 DocTabs 失败：" + ex.Message); } // 任何问题都不能影响 Office 本身
         }
 
         // Office 一直开着、而 DocTabs 中途没了（被结束、崩溃）时，几秒内把它拉回来；用户从托盘主动退出的不拉
@@ -124,13 +131,15 @@ namespace DocTabs
         {
             try
             {
-                if (watchLaunches >= 5 || IsRunning()) return;
+                if (IsRunning()) return;
+                // 连着拉起 5 次都没留住（比如开机时系统还没就绪）就隔一分钟再试，不放弃
+                if (watchLaunches >= 5 && (DateTime.Now - lastLaunch).TotalSeconds < 60) return;
                 using (var k = Registry.CurrentUser.OpenSubKey(SettingsKey))
                     if (k != null && Equals(k.GetValue(UserExitedValue), 1)) return;
                 watchLaunches++;
-                Start();
+                Start("DocTabs 不在运行，重新启动（第 " + watchLaunches + " 次）");
             }
-            catch { }
+            catch (Exception ex) { Log.Write("重新启动 DocTabs 失败：" + ex.Message); }
         }
 
         static bool IsRunning()
@@ -141,8 +150,10 @@ namespace DocTabs
             return true;
         }
 
-        static void Start()
+        static void Start(string why)
         {
+            lastLaunch = DateTime.Now;
+            Log.Write(why);
             string exe = typeof(Connect).Assembly.Location;
             var psi = new System.Diagnostics.ProcessStartInfo(exe, "/office")
             {
@@ -165,11 +176,49 @@ namespace DocTabs
             return true;
         }
 
-        // 程序换了位置或升级了版本后，注册信息要跟着更新
+        // Office 2016 及以后是 16.0，2013 是 15.0
+        static IEnumerable<string> OfficeVersions()
+        {
+            yield return "16.0";
+            using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Office\15.0"))
+                if (k != null) yield return "15.0";
+        }
+
+        static string ResiliencyKey(string ver, string app) { return @"Software\Microsoft\Office\" + ver + @"\" + app + @"\Resiliency"; }
+
+        // 程序换了位置或升级了版本，或者 Office 把插件停用了（加载出错、嫌它拖慢启动），注册信息都要重写
         public static bool IsCurrent()
         {
             using (var k = Registry.CurrentUser.OpenSubKey(ClsidKey + @"\InprocServer32"))
-                return k != null && Equals(k.GetValue("CodeBase"), CodeBase) && Equals(k.GetValue("Assembly"), AssemblyName);
+                if (k == null || !Equals(k.GetValue("CodeBase"), CodeBase) || !Equals(k.GetValue("Assembly"), AssemblyName)) return false;
+            foreach (var app in Apps)
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(AddinKey(app)))
+                    if (k == null || !Equals(k.GetValue("LoadBehavior"), 3)) return false;
+                using (var k = Registry.CurrentUser.OpenSubKey(ResiliencyKey("16.0", app) + @"\DoNotDisableAddinList"))
+                    if (k == null || k.GetValue(ProgId) == null) return false;
+            }
+            return !ClearDisabledItems(false);
+        }
+
+        // Office 因出错而停用插件时，会在 DisabledItems 里记一条带程序路径的二进制记录。remove 为 false 时只检查
+        static bool ClearDisabledItems(bool remove)
+        {
+            bool found = false;
+            foreach (var ver in OfficeVersions())
+                foreach (var app in Apps)
+                    using (var k = Registry.CurrentUser.OpenSubKey(ResiliencyKey(ver, app) + @"\DisabledItems", remove))
+                    {
+                        if (k == null) continue;
+                        foreach (var name in k.GetValueNames())
+                        {
+                            var data = k.GetValue(name) as byte[];
+                            if (data == null || Encoding.Unicode.GetString(data).IndexOf("doctabs", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                            found = true;
+                            if (remove) k.DeleteValue(name, false);
+                        }
+                    }
+            return found;
         }
 
         // 只写当前用户的注册表，不需要管理员权限；32 / 64 位 Office 都登记
@@ -205,17 +254,46 @@ namespace DocTabs
                     k.SetValue("Description", "打开 Word / Excel 时自动启动 DocTabs 标签栏");
                     k.SetValue("LoadBehavior", 3, RegistryValueKind.DWord);
                 }
+            // 开机后第一次打开 Office 时 .NET 冷启动较慢，Office 可能把插件当成“拖慢启动”自动停用：列入“始终启用”
+            foreach (var ver in OfficeVersions())
+                foreach (var app in Apps)
+                    using (var k = Registry.CurrentUser.CreateSubKey(ResiliencyKey(ver, app) + @"\DoNotDisableAddinList"))
+                        k.SetValue(ProgId, 1, RegistryValueKind.DWord);
+            ClearDisabledItems(true);
         }
 
         public static void Unregister()
         {
             foreach (var app in Apps) Registry.CurrentUser.DeleteSubKeyTree(AddinKey(app), false);
+            foreach (var ver in OfficeVersions())
+                foreach (var app in Apps)
+                    using (var k = Registry.CurrentUser.OpenSubKey(ResiliencyKey(ver, app) + @"\DoNotDisableAddinList", true))
+                        if (k != null) k.DeleteValue(ProgId, false);
             foreach (var view in new[] { RegistryView.Registry64, RegistryView.Registry32 })
                 using (var root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
                 {
                     root.DeleteSubKeyTree(@"Software\Classes\" + ProgId, false);
                     root.DeleteSubKeyTree(ClsidKey, false);
                 }
+        }
+    }
+
+    // 运行记录，排查“没有自动启动”这类问题用：%LOCALAPPDATA%\DocTabs\DocTabs.log，超过 64 KB 清空重记
+    static class Log
+    {
+        public static void Write(string text)
+        {
+            try
+            {
+                string dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DocTabs");
+                System.IO.Directory.CreateDirectory(dir);
+                string file = System.IO.Path.Combine(dir, "DocTabs.log");
+                var fi = new System.IO.FileInfo(file);
+                if (fi.Exists && fi.Length > 64 * 1024) fi.Delete();
+                var p = System.Diagnostics.Process.GetCurrentProcess();
+                System.IO.File.AppendAllText(file, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + p.ProcessName + "(" + p.Id + ")  " + text + "\r\n", Encoding.UTF8);
+            }
+            catch { }
         }
     }
 
@@ -247,16 +325,17 @@ namespace DocTabs
         public readonly HashSet<IntPtr> Shifted = new HashSet<IntPtr>();
         public readonly HashSet<IntPtr> PseudoMax = new HashSet<IntPtr>();
         readonly HashSet<IntPtr> noShift = new HashSet<IntPtr>();
-        // 拖动/缩放某组的当前文档时，被暂时隐藏的同组其他文档
-        public readonly HashSet<IntPtr> HiddenByUs = new HashSet<IntPtr>();
+        // 拖动/缩放某组的当前文档时，暂时挪到屏幕外的同组其他文档，及其原来的位置。
+        // 不用隐藏：Excel 处理隐藏/显示一个窗口要几百毫秒，期间拖动会卡住；挪到屏幕外只要几毫秒
+        public readonly HashSet<IntPtr> Parked = new HashSet<IntPtr>();
+        readonly Dictionary<IntPtr, Native.RECT> parkedFrom = new Dictionary<IntPtr, Native.RECT>();
         public TabBar DragGroup;
         DateTime dragStart;
-        // 从标签栏开始的拖动：被拖的窗口、松手后要切到前台的窗口、是否由我们自己跟着鼠标挪
+        // 从标签栏开始的拖动：被拖的窗口、发起拖动的标签栏、松手后要切到前台的窗口
         IntPtr moveWin, activateAfterMove;
-        bool movePosted, selfMove, moveSeen, moveBtnUp;
-        int movePosts;
-        Point selfMoveOffset, lastSelfPos;
-        DateTime moveStarted, moveReleased, lastMovePost;
+        TabBar dragSource;
+        Point dragOffset, lastTarget, posAtSend;
+        DateTime lastSend;
         readonly System.Windows.Forms.Timer moveWatch;
 
         // 用户点了某个文档窗口的 ×（或按了 Alt+F4）：该窗口真正关掉后，它所在的整组一起关闭
@@ -297,15 +376,15 @@ namespace DocTabs
             fallbackTimer.Tick += delegate
             {
                 // 兜底：漏掉了“拖动结束”通知时，别让文档一直处于隐藏状态
-                if (DragGroup != null && (DateTime.Now - dragStart).TotalSeconds > 30) EndWindowDrag();
-                if (DragGroup == null && HiddenByUs.Count > 0 && !revealTimer.Enabled) RevealHidden();
+                if (DragGroup != null && moveWin == IntPtr.Zero && (DateTime.Now - dragStart).TotalSeconds > 30) EndWindowDrag();
+                if (DragGroup == null && Parked.Count > 0 && !revealTimer.Enabled) RevealParked();
                 Scan();
                 if (this.byOffice) CheckOfficeGone();
             };
             fallbackTimer.Start();
             // 松手后稍等当前文档的最终位置稳定，再把其他文档放到同一位置并显示出来
             revealTimer = new System.Windows.Forms.Timer { Interval = 80 };
-            revealTimer.Tick += delegate { revealTimer.Stop(); RevealHidden(); };
+            revealTimer.Tick += delegate { revealTimer.Stop(); RevealParked(); };
             moveWatch = new System.Windows.Forms.Timer { Interval = 10 };
             moveWatch.Tick += delegate { MoveWatchTick(); };
 
@@ -389,7 +468,7 @@ namespace DocTabs
             foreach (var t in moved) dst.Tabs.Add(t);
             Active = dst;
             foreach (var t in moved)
-                if (t.Handle != cur && !HiddenByUs.Contains(t.Handle)) dst.ApplyGroupState(t.Handle, false);
+                if (t.Handle != cur && !Parked.Contains(t.Handle)) dst.ApplyGroupState(t.Handle, false);
             if (cur == IntPtr.Zero && moved.Count > 0) cur = moved[0].Handle;
             dst.LayoutTabs();
             if (cur != IntPtr.Zero) dst.ActivateDoc(cur);
@@ -397,136 +476,133 @@ namespace DocTabs
         }
 
         // 拖动结束时鼠标落在另一组的标签上：并进那一组。拖到屏幕最上沿是系统的“最大化”手势，不算
-        void TryMergeOnDrop(TabBar src)
+        void TryMergeOnDrop(TabBar src, Point c)
         {
             if (src == null || !Groups.Contains(src)) return;
-            Point c = Cursor.Position;
             Rectangle mon = Screen.FromPoint(c).Bounds;
             if (c.Y <= mon.Top + 2) return;
             foreach (var g in Groups)
                 if (g != src && g.Visible && g.TabStripContains(c)) { Merge(src, g); return; }
         }
 
-        // 交给系统的拖动流程移动窗口（与拖标题栏完全相同：流畅、可贴边分屏）。调用时左键必须仍按着。
-        // 按着鼠标时不能把窗口切到前台：Office 会等到松手才开始处理拖动，窗口就在松手后一直粘着鼠标。
-        // 所以只把窗口提到最上面，松手后再切到前台。前台是另一个程序（线程）时系统的拖动拿不到鼠标，
-        // 系统的拖动迟迟没开始时也一样，改由我们自己跟着鼠标挪
-        public void StartNativeMove(IntPtr h)
+        // ---------------- 从标签栏拖动窗口 ----------------
+        // 不交给系统的拖动流程：按下发生在标签栏上，Office 的拖动流程常常要等松手才开始。
+        // 鼠标一直由按下的那个标签栏捕获，每来一条鼠标移动就把窗口挪过去（窗口用异步方式挪，
+        // 上一次还没生效就先不发，免得 Office 忙时请求排队、之后按鼠标轨迹“补跑”）。
+        // 按着鼠标时不能把窗口切到前台（Office 会等到松手才处理），只把它提到最上面，松手后再切
+
+        public TabBar DragSource { get { return moveWin != IntPtr.Zero ? dragSource : null; } }
+
+        public void BeginDrag(IntPtr h, TabBar source)
         {
-            Native.ReleaseCapture();
+            Native.RECT r;
+            Native.GetWindowRect(h, out r);
+            BeginDrag(h, source, new Point(r.Left, r.Top));
+        }
+
+        // winPos：窗口左上角此刻应在的位置（刚异步下发的位置可能还没生效，不能现读）
+        public void BeginDrag(IntPtr h, TabBar source, Point winPos)
+        {
             Point c = Cursor.Position;
-            IntPtr fg = Native.GetForegroundWindow();
-            if (fg != h)
+            if (Native.GetForegroundWindow() != h)
             {
-                Native.SetWindowPos(h, Native.HWND_TOP, 0, 0, 0, 0, Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE);
+                Native.SetWindowPos(h, Native.HWND_TOP, 0, 0, 0, 0,
+                    Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_ASYNCWINDOWPOS);
                 activateAfterMove = h;
             }
             Native.RECT r;
             Native.GetWindowRect(h, out r);
-            selfMoveOffset = new Point(r.Left - c.X, r.Top - c.Y);
-            lastSelfPos = new Point(r.Left, r.Top);
+            dragOffset = new Point(winPos.X - c.X, winPos.Y - c.Y);
+            lastTarget = winPos;
+            posAtSend = new Point(r.Left, r.Top);
+            lastSend = DateTime.MinValue;
             moveWin = h;
-            moveSeen = false;
-            moveBtnUp = false;
-            selfMove = false;
-            movePosts = 0;
-            moveStarted = DateTime.Now;
-            movePosted = fg == h || ThreadOf(fg) == ThreadOf(h);
-            if (movePosted)
-                Native.PostMessage(h, Native.WM_SYSCOMMAND, (IntPtr)(Native.SC_MOVE | Native.HTCAPTION),
-                    (IntPtr)((c.Y << 16) | (c.X & 0xFFFF)));
-            else StartSelfMove(h);
+            dragSource = source;
+            var g = GroupOf(h);
+            if (g != null && g.CurDoc == h && DragGroup != g) BeginWindowDrag(g);
             moveWatch.Start();
         }
 
-        void StartSelfMove(IntPtr h)
+        // 跟着鼠标走一步（标签栏收到鼠标移动时调用；计时器兜底）
+        public void DragMove()
         {
-            selfMove = true;
-            var g = GroupOf(h);
-            if (g != null && g.CurDoc == h && DragGroup != g) BeginWindowDrag(g);
+            IntPtr h = moveWin;
+            if (h == IntPtr.Zero) return;
+            Point c = Cursor.Position;
+            var p = new Point(c.X + dragOffset.X, c.Y + dragOffset.Y);
+            if (p == lastTarget) return;
+            // 生效 = 到了上次要的位置，或者至少动过了（跨到缩放不同的屏幕时 Office 会自己微调位置）
+            Native.RECT r;
+            Native.GetWindowRect(h, out r);
+            var now = new Point(r.Left, r.Top);
+            if (now != lastTarget && now == posAtSend && (DateTime.Now - lastSend).TotalMilliseconds < 250) return;
+            posAtSend = now;
+            lastTarget = p;
+            lastSend = DateTime.Now;
+            MoveWindowTo(h, c);
         }
 
-        static uint ThreadOf(IntPtr h)
+        public void EndDrag()
         {
-            uint pid;
-            return h == IntPtr.Zero ? 0 : Native.GetWindowThreadProcessId(h, out pid);
+            IntPtr h = moveWin;
+            if (h == IntPtr.Zero) return;
+            moveWin = IntPtr.Zero;
+            dragSource = null;
+            moveWatch.Stop();
+            Point c = Cursor.Position;
+            if (Native.IsWindow(h) && !SnapOnDrop(h, c)) MoveWindowTo(h, c);
+            if (DragGroup != null) EndWindowDrag();
+            else TryMergeOnDrop(GroupOf(h), c);
+            ActivateAfterMove();
         }
 
-        // 窗口 h 是否正处在系统的拖动/缩放流程里
-        static bool InMoveLoop(IntPtr h)
-        {
-            var gi = new Native.GUITHREADINFO { cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO)) };
-            return Native.GetGUIThreadInfo(ThreadOf(h), ref gi) && (gi.flags & Native.GUI_INMOVESIZE) != 0 && gi.hwndMoveSize == h;
-        }
-
-        // 结束窗口 h 上多余的系统拖动：先补发松开左键，不行再按回车（窗口停在当前位置）
-        void EndMoveLoop(IntPtr h)
-        {
-            if ((DateTime.Now - lastMovePost).TotalMilliseconds < 150) return;
-            lastMovePost = DateTime.Now;
-            bool hard = movePosts++ >= 2;
-            Native.PostMessage(h, hard ? Native.WM_KEYDOWN : Native.WM_LBUTTONUP,
-                hard ? (IntPtr)Native.VK_RETURN : IntPtr.Zero, IntPtr.Zero);
-        }
-
-        // 拖动期间每 10ms 一次：自己挪窗口时跟着鼠标走；松手后系统的拖动若还没结束（窗口会一直粘着鼠标），替它结束
+        // 计时器兜底：标签栏丢了鼠标捕获（比如被隐藏）时照样跟着走，并发现松手
         void MoveWatchTick()
         {
             IntPtr h = moveWin;
-            if (h == IntPtr.Zero || !Native.IsWindow(h)) { StopMoveWatch(); return; }
+            if (h == IntPtr.Zero) { moveWatch.Stop(); return; }
             int vk = SystemInformation.MouseButtonsSwapped ? Native.VK_RBUTTON : Native.VK_LBUTTON;
-            bool down = (Native.GetAsyncKeyState(vk) & 0x8000) != 0;
-            bool inLoop = movePosted && InMoveLoop(h);
-            if (down && !moveBtnUp)
-            {
-                if (selfMove)
-                {
-                    // 系统的拖动迟到了，而我们已经在挪：结束它
-                    if (inLoop) { moveSeen = true; EndMoveLoop(h); }
-                    Point c = Cursor.Position;
-                    var p = new Point(c.X + selfMoveOffset.X, c.Y + selfMoveOffset.Y);
-                    if (p != lastSelfPos)
-                    {
-                        lastSelfPos = p;
-                        Native.SetWindowPos(h, IntPtr.Zero, p.X, p.Y, 0, 0,
-                            Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_ASYNCWINDOWPOS);
-                    }
-                }
-                else if (inLoop) moveSeen = true;
-                else if (!moveSeen && (DateTime.Now - moveStarted).TotalMilliseconds > 150) StartSelfMove(h);
-                return;
-            }
-            // 松手后又按下：用户开始了新的操作，不再管
-            if (down) { StopMoveWatch(); return; }
-            if (!moveBtnUp)
-            {
-                moveBtnUp = true;
-                moveReleased = DateTime.Now;
-                if (selfMove)
-                {
-                    selfMove = false;
-                    if (DragGroup != null) EndWindowDrag();
-                    else TryMergeOnDrop(GroupOf(h));
-                    ActivateAfterMove();
-                }
-            }
-            double ms = (DateTime.Now - moveReleased).TotalMilliseconds;
-            if (inLoop)
-            {
-                moveSeen = true;
-                if (ms > 80) EndMoveLoop(h);
-                return;
-            }
-            // 系统的拖动已经结束；或者还没开始——再等一会儿，防止它在松手后才开始
-            if (moveSeen || !movePosted || ms > 2000) StopMoveWatch();
+            if (!Native.IsWindow(h) || (Native.GetAsyncKeyState(vk) & 0x8000) == 0) { EndDrag(); return; }
+            DragMove();
         }
 
-        void StopMoveWatch()
+        // 把正在拖的窗口放到鼠标 c 处（保持按下时抓住的位置）
+        void MoveWindowTo(IntPtr h, Point c)
         {
-            moveWatch.Stop();
-            moveWin = IntPtr.Zero;
-            selfMove = false;
-            ActivateAfterMove();
+            Native.SetWindowPos(h, IntPtr.Zero, c.X + dragOffset.X, c.Y + dragOffset.Y, 0, 0,
+                Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_ASYNCWINDOWPOS);
+        }
+
+        // 松手时鼠标顶到屏幕外沿：与系统贴边一样，上沿最大化、左右沿各占半屏（两块屏幕相接的那条边不算）
+        bool SnapOnDrop(IntPtr h, Point c)
+        {
+            Screen scr = Screen.FromPoint(c);
+            Rectangle mon = scr.Bounds, wa = scr.WorkingArea;
+            if (c.Y <= mon.Top + 1 && !OnAnyScreen(c.X, c.Y - 4))
+            {
+                Native.ShowWindowAsync(h, Native.SW_MAXIMIZE);
+                return true;
+            }
+            bool left = c.X <= mon.Left + 1 && !OnAnyScreen(c.X - 4, c.Y);
+            bool right = c.X >= mon.Right - 2 && !OnAnyScreen(c.X + 4, c.Y);
+            if (!left && !right) return false;
+            int half = wa.Width / 2;
+            Rectangle want = left ? new Rectangle(wa.Left, wa.Top, half, wa.Height) : new Rectangle(wa.Left + half, wa.Top, wa.Width - half, wa.Height);
+            // 加上程序自身的隐形边框，让看得见的边框正好贴边（之后顶到上沿的窗口会自动往下让出标签栏）
+            Native.RECT r;
+            Native.GetWindowRect(h, out r);
+            Native.RECT f = Native.FrameBounds(h, r);
+            int l = want.Left - (f.Left - r.Left), t = want.Top - (f.Top - r.Top);
+            int rr = want.Right + (r.Right - f.Right), b = want.Bottom + (r.Bottom - f.Bottom);
+            Native.SetWindowPos(h, IntPtr.Zero, l, t, rr - l, b - t,
+                Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_ASYNCWINDOWPOS);
+            return true;
+        }
+
+        static bool OnAnyScreen(int x, int y)
+        {
+            foreach (var s in Screen.AllScreens) if (s.Bounds.Contains(x, y)) return true;
+            return false;
         }
 
         // 拖完了：把被拖的窗口切到前台
@@ -592,13 +668,20 @@ namespace DocTabs
             if (!Native.GetWindowRect(h, out r)) return false;
             Native.RECT f = Native.FrameBounds(h, r);
             float ws = Native.MonitorScale(h);
-            return x >= f.Right - 52 * ws && x <= f.Right && y >= f.Top && y <= f.Top + 56 * ws;
+            // 只算标题栏那一行；再往下是“批注 / 共享”按钮
+            return x >= f.Right - 50 * ws && x <= f.Right && y >= f.Top && y <= f.Top + 46 * ws;
         }
 
         void SetCloseIntent(IntPtr h)
         {
             closeIntent = h;
             closeIntentTime = DateTime.Now;
+        }
+
+        // 关闭一个文档窗口，与点它标题栏上的 × 相同。不能发 WM_CLOSE：Excel 收到它会退出整个程序，所有工作簿一起关掉
+        public static void CloseDoc(IntPtr h)
+        {
+            Native.PostMessage(h, Native.WM_SYSCOMMAND, (IntPtr)Native.SC_CLOSE, IntPtr.Zero);
         }
 
         public void StartCascade(IEnumerable<IntPtr> handles)
@@ -619,7 +702,7 @@ namespace DocTabs
                 if (!Native.IsWindow(h) || GroupOf(h) == null) continue;
                 cascadeCur = h;
                 cascadeStepTime = DateTime.Now;
-                Native.PostMessage(h, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                CloseDoc(h);
                 return;
             }
         }
@@ -711,7 +794,7 @@ namespace DocTabs
 
         bool EnumCallback(IntPtr h, IntPtr l)
         {
-            if (!Native.IsWindowVisible(h) && !HiddenByUs.Contains(h)) return true;
+            if (!Native.IsWindowVisible(h) && !Parked.Contains(h)) return true;
             if (Native.GetWindow(h, Native.GW_OWNER) != IntPtr.Zero) return true;
             DocKind kind;
             if (!TryKind(Native.GetClassNameOf(h), out kind)) return true;
@@ -767,11 +850,11 @@ namespace DocTabs
             {
                 case Native.EVENT_SYSTEM_MOVESIZESTART:
                     g = GroupOf(hwnd);
-                    if (g != null && hwnd == g.CurDoc) BeginWindowDrag(g);
+                    if (g != null && hwnd == g.CurDoc && DragGroup == null) BeginWindowDrag(g);
                     return;
                 case Native.EVENT_SYSTEM_MOVESIZEEND:
-                    // 我们自己挪窗口时，迟到的系统拖动被结束掉不算松手
-                    if (DragGroup != null && !selfMove) EndWindowDrag();
+                    // 从标签栏拖动时由 EndDrag 收尾
+                    if (DragGroup != null && moveWin == IntPtr.Zero) EndWindowDrag();
                     return;
                 case Native.EVENT_OBJECT_LOCATIONCHANGE:
                     g = GroupOf(hwnd);
@@ -820,10 +903,34 @@ namespace DocTabs
             foreach (var t in g.Tabs)
             {
                 IntPtr o = t.Handle;
-                if (o == g.CurDoc || Native.IsIconic(o) || !Native.IsWindowVisible(o)) continue;
-                HiddenByUs.Add(o);
-                Native.ShowWindowAsync(o, Native.SW_HIDE);
+                if (o == g.CurDoc || Native.IsIconic(o) || !Native.IsWindowVisible(o) || Parked.Contains(o)) continue;
+                Native.RECT r;
+                if (!Native.GetWindowRect(o, out r)) continue;
+                Parked.Add(o);
+                parkedFrom[o] = r;
+                Point spot;
+                if (ParkSpot(o, r, out spot))
+                    Native.SetWindowPos(o, IntPtr.Zero, spot.X, spot.Y, 0, 0,
+                        Native.SWP_NOSIZE | Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER | Native.SWP_ASYNCWINDOWPOS);
+                else
+                    Native.ShowWindowAsync(o, Native.SW_HIDE);
             }
+        }
+
+        // 屏幕外的停放位置：就在窗口所在显示器的正上方（或正下方），离它最近，Office 不会因为换了显示器而按新缩放重排
+        static bool ParkSpot(IntPtr h, Native.RECT r, out Point spot)
+        {
+            Rectangle mon = Screen.FromHandle(h).Bounds;
+            int w = r.Right - r.Left, ht = r.Bottom - r.Top;
+            foreach (int y in new[] { mon.Top - ht - 60, mon.Bottom + 60 })
+            {
+                var rect = new Rectangle(r.Left, y, w, ht);
+                bool clear = true;
+                foreach (var s in Screen.AllScreens) if (s.Bounds.IntersectsWith(rect)) { clear = false; break; }
+                if (clear) { spot = rect.Location; return true; }
+            }
+            spot = Point.Empty;
+            return false;
         }
 
         void EndWindowDrag()
@@ -832,20 +939,22 @@ namespace DocTabs
             DragGroup = null;
             revealTimer.Stop();
             revealTimer.Start();
-            TryMergeOnDrop(g);
+            TryMergeOnDrop(g, Cursor.Position);
         }
 
-        void RevealHidden()
+        void RevealParked()
         {
-            if (HiddenByUs.Count == 0) return;
+            if (Parked.Count == 0) return;
             var touched = new HashSet<TabBar>();
-            foreach (var o in new List<IntPtr>(HiddenByUs))
+            foreach (var o in new List<IntPtr>(Parked))
             {
                 if (!Native.IsWindow(o)) continue;
                 var g = GroupOf(o);
+                Native.RECT from;
+                bool had = parkedFrom.TryGetValue(o, out from);
                 if (g != null && g.HasState && !g.GroupMax)
                 {
-                    // 先摆到与当前文档相同的位置，再显示
+                    // 摆到与当前文档相同的位置
                     var wp = Native.GetPlacement(o);
                     wp.flags = 0;
                     wp.showCmd = Native.SW_SHOWNOACTIVATE;
@@ -855,16 +964,21 @@ namespace DocTabs
                     PseudoMax.Remove(o);
                     touched.Add(g);
                 }
-                else
+                else if (had)
                 {
-                    Native.ShowWindow(o, Native.SW_SHOWNOACTIVATE);
+                    // 整组仍是最大化：放回原处
+                    Native.SetWindowPos(o, IntPtr.Zero, from.Left, from.Top, from.Right - from.Left, from.Bottom - from.Top,
+                        Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER | Native.SWP_ASYNCWINDOWPOS);
                 }
+                // 没地方停放、只好隐藏的那些
+                if (!Native.IsWindowVisible(o)) Native.ShowWindow(o, Native.SW_SHOWNOACTIVATE);
                 // 放在当前文档后面，不要盖住它
                 if (g != null && g.CurDoc != IntPtr.Zero && g.CurDoc != o && Native.IsWindow(g.CurDoc))
                     Native.SetWindowPos(o, g.CurDoc, 0, 0, 0, 0,
                         Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER);
             }
-            HiddenByUs.Clear();
+            Parked.Clear();
+            parkedFrom.Clear();
             // 跨到缩放不同的屏幕时，Office 会按新 DPI 自行调整窗口大小，稍后再校正一次
             foreach (var g in touched) g.ScheduleSync();
             ScheduleScan();
@@ -875,7 +989,7 @@ namespace DocTabs
         // 最大化的文档窗口整体下移，把顶部让给标签栏
         public void EnsureShift(IntPtr h)
         {
-            if (!Native.IsZoomed(h)) return;
+            if (!Native.IsZoomed(h) || Parked.Contains(h)) return;
             int bh = BarHeightFor(h);
             if (!SetFrameTop(h, bh)) return;
             Shifted.Add(h);
@@ -1020,6 +1134,7 @@ namespace DocTabs
                     else if (OfficeAddin.IsRegistered() && !OfficeAddin.IsCurrent())
                     {
                         OfficeAddin.Register();
+                        Log.Write("已更新 Office 插件登记（程序位置/版本变化，或 Office 停用过插件）");
                     }
                 }
             }
@@ -1054,7 +1169,11 @@ namespace DocTabs
                 }
             }
             officeGoneTicks = any ? 0 : officeGoneTicks + 1;
-            if (officeGoneTicks >= 3) ExitApp(false);
+            if (officeGoneTicks >= 3)
+            {
+                Log.Write("Word / Excel 已全部关闭，退出");
+                ExitApp(false);
+            }
         }
 
         static Icon MakeTrayIcon(float s)
@@ -1088,6 +1207,7 @@ namespace DocTabs
             exiting = true;
             if (byUser)
             {
+                Log.Write("用户选择退出");
                 try
                 {
                     using (var k = Registry.CurrentUser.CreateSubKey(OfficeAddin.SettingsKey))
@@ -1106,7 +1226,7 @@ namespace DocTabs
             hooks.Clear();
             SystemEvents.DisplaySettingsChanged -= OnDisplayChanged;
             DragGroup = null;
-            RevealHidden();
+            RevealParked();
             RestoreShifted();
             foreach (var g in Groups.ToArray()) g.Destroy();
             Groups.Clear();
@@ -1227,7 +1347,12 @@ namespace DocTabs
             // 标签栏的位置和大小完全由我们自己按文档所在屏幕计算，不接受系统按 DPI 建议的尺寸
             if (m.Msg == Native.WM_DPICHANGED) { m.Result = IntPtr.Zero; return; }
             // 外部发来的关闭请求（如结束任务）：整个程序正常退出，把调整过的窗口恢复原状
-            if (m.Msg == Native.WM_CLOSE && !destroying) { mgr.ExitApp(false); return; }
+            if (m.Msg == Native.WM_CLOSE && !destroying)
+            {
+                Log.Write("收到外部关闭消息（如关机、注销），退出");
+                mgr.ExitApp(false);
+                return;
+            }
             base.WndProc(ref m);
         }
 
@@ -1385,7 +1510,7 @@ namespace DocTabs
             foreach (var t in Tabs)
             {
                 IntPtr o = t.Handle;
-                if (o == h || Native.IsIconic(o) || Native.IsZoomed(o) || mgr.PseudoMax.Contains(o)) continue;
+                if (o == h || Native.IsIconic(o) || Native.IsZoomed(o) || mgr.PseudoMax.Contains(o) || mgr.Parked.Contains(o)) continue;
                 Native.RECT ro;
                 if (!Native.GetWindowRect(o, out ro)) continue;
                 Native.RECT fo = Native.FrameBounds(o, ro);
@@ -1404,7 +1529,7 @@ namespace DocTabs
             foreach (var t in Tabs)
             {
                 IntPtr h = t.Handle;
-                if (h == CurDoc || Native.IsIconic(h) || mgr.HiddenByUs.Contains(h)) continue;
+                if (h == CurDoc || Native.IsIconic(h) || mgr.Parked.Contains(h)) continue;
                 ApplyGroupState(h, false);
             }
         }
@@ -1745,6 +1870,8 @@ namespace DocTabs
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            // 正在从这个标签栏拖动窗口：鼠标每动一下就跟一下
+            if (mgr.DragSource == this) { mgr.DragMove(); return; }
             if (pressOnBar && e.Button == MouseButtons.Left && CheckStartDrag(Cursor.Position)) return;
             if (pressOnBar && pressIndex >= 0 && e.Button == MouseButtons.Left)
             {
@@ -1816,6 +1943,7 @@ namespace DocTabs
         {
             base.OnMouseUp(e);
             if (e.Button != MouseButtons.Left) return;
+            if (mgr.DragSource == this) { mgr.EndDrag(); return; }
             bool wasPress = pressOnBar;
             int pressed = pressIndex;
             bool wasDrag = dragging;
@@ -1915,7 +2043,7 @@ namespace DocTabs
             pressTimer.Stop();
         }
 
-        // 移动整个窗口：最大化时先在鼠标下还原，然后交给系统的拖动流程
+        // 移动整个窗口：最大化时先在鼠标下还原，然后跟着鼠标走
         void BeginBarMove(Point c)
         {
             IntPtr h = pressIndex >= 0 && pressIndex < Tabs.Count ? Tabs[pressIndex].Handle : CurDoc;
@@ -1924,16 +2052,17 @@ namespace DocTabs
             hoverIndex = -1;
             hoverClose = false;
             tip.Hide(this);
-            // 按着鼠标时不切前台（见 StartNativeMove），只更新分组状态，松手后再切
+            // 按着鼠标时不切前台（见 BeginDrag），只更新分组状态，松手后再切
             if (h != CurDoc) { ApplyGroupState(h, true); CurDoc = h; }
             mgr.Active = this;
-            if (mgr.IsMax(h)) RestoreUnderCursor(h, c, pressScreen.X - Left, pressScreen.Y - Top);
             Invalidate();
-            mgr.StartNativeMove(h);
+            if (mgr.IsMax(h)) mgr.BeginDrag(h, this, RestoreUnderCursor(h, c, pressScreen.X - Left, pressScreen.Y - Top));
+            else mgr.BeginDrag(h, this);
+            Capture = true;
         }
 
-        // 从最大化状态拖出：还原成普通大小，并让鼠标仍落在标签栏里原来抓住的位置
-        void RestoreUnderCursor(IntPtr h, Point c, int grabX, int grabY)
+        // 从最大化状态拖出：还原成普通大小，并让鼠标仍落在标签栏里原来抓住的位置；返回窗口左上角
+        Point RestoreUnderCursor(IntPtr h, Point c, int grabX, int grabY)
         {
             var wp = Native.GetPlacement(h);
             Native.RECT n = HasState ? GroupNormal : wp.rcNormalPosition;
@@ -1945,11 +2074,11 @@ namespace DocTabs
             int frameW = w - side * 2;
             Rectangle wa = Screen.FromPoint(c).WorkingArea;
             if (grabX > frameW - 60 * s) grabX = (int)((long)frameW * (c.X - wa.Left) / Math.Max(1, wa.Width));
-            PlaceNormal(h, this, c.X - grabX - side, c.Y - grabY, w, ht, c);
+            return PlaceNormal(h, this, c.X - grabX - side, c.Y - grabY, w, ht, c);
         }
 
-        // 把窗口 h 以普通状态放到屏幕坐标 (left, barTop + 标签栏高度) 处，并记为分组 g 的还原位置
-        void PlaceNormal(IntPtr h, TabBar g, int left, int barTop, int w, int ht, Point c)
+        // 把窗口 h 以普通状态放到屏幕坐标 (left, barTop + 标签栏高度) 处，并记为分组 g 的还原位置；返回窗口左上角
+        Point PlaceNormal(IntPtr h, TabBar g, int left, int barTop, int w, int ht, Point c)
         {
             Screen scr = Screen.FromPoint(c);
             Rectangle wa = scr.WorkingArea, mon = scr.Bounds;
@@ -1963,11 +2092,20 @@ namespace DocTabs
             g.GroupMax = false;
             g.GroupNormal = n;
             g.HasState = true;
+            // 拖动刚开始，不能让标签栏等 Office：本来就是普通窗口的，异步挪过去；最大化/最小化的才需要同步还原。
+            // 都不激活（按着鼠标时激活，Office 会等到松手才处理后面的拖动）
+            if (!Native.IsZoomed(h) && !Native.IsIconic(h))
+            {
+                Native.SetWindowPos(h, IntPtr.Zero, left, top, w, ht,
+                    Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER | Native.SWP_ASYNCWINDOWPOS);
+                return new Point(left, top);
+            }
             var wp = Native.GetPlacement(h);
             wp.flags = 0;
-            wp.showCmd = Native.SW_SHOWNORMAL;
+            wp.showCmd = Native.SW_SHOWNOACTIVATE;
             wp.rcNormalPosition = n;
             Native.SetWindowPlacement(h, ref wp);
+            return new Point(left, top);
         }
 
         // 把第 index 个标签拆成单独一组，窗口出现在鼠标下面并继续跟着鼠标走
@@ -1992,10 +2130,11 @@ namespace DocTabs
             var ng = SplitOff(index);
             // 新的标签栏只有一个标签，它的左边距是 6 像素（按缩放）
             int frameLeft = c.X - (int)(6 * s + grabX);
-            PlaceNormal(h, ng, frameLeft - side, c.Y - grabY, w, ht, c);
-            // 不在这里切前台（见 StartNativeMove），松手后再切
-            mgr.StartNativeMove(h);
+            Point pos = PlaceNormal(h, ng, frameLeft - side, c.Y - grabY, w, ht, c);
+            // 不在这里切前台（见 BeginDrag），松手后再切；鼠标仍由本标签栏捕获，拖动消息照样发到这里
+            mgr.BeginDrag(h, this, pos);
             ng.UpdatePlacement();
+            Capture = true;
         }
 
         // 右键菜单“拆分为单独窗口”：在原窗口旁边错开一点放
@@ -2070,7 +2209,7 @@ namespace DocTabs
         void CloseTab(DocTab t)
         {
             // Office 会自行弹出“是否保存”提示
-            Native.PostMessage(t.Handle, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            Manager.CloseDoc(t.Handle);
             mgr.ScheduleScan();
         }
     }
@@ -2080,7 +2219,7 @@ namespace DocTabs
         public const int WS_EX_TOOLWINDOW = 0x80, WS_EX_NOACTIVATE = 0x08000000;
         public const int WS_CAPTION = 0x00C00000, GWL_STYLE = -16, GWL_EXSTYLE = -20, WS_EX_TOPMOST = 0x8;
         public const int WM_MOUSEACTIVATE = 0x21, MA_NOACTIVATE = 3, WM_CLOSE = 0x10;
-        public const int WM_SYSCOMMAND = 0x112, SC_MOVE = 0xF010, HTCAPTION = 2;
+        public const int WM_SYSCOMMAND = 0x112, SC_CLOSE = 0xF060;
         public const uint GW_OWNER = 4, GW_HWNDPREV = 3, GA_ROOT = 2;
         public const int SW_SHOWNORMAL = 1, SW_MAXIMIZE = 3, SW_SHOWNOACTIVATE = 4, SW_SHOWMINNOACTIVE = 7, SW_RESTORE = 9;
         public const uint SWP_NOSIZE = 1, SWP_NOMOVE = 2, SWP_NOZORDER = 4, SWP_NOACTIVATE = 0x10, SWP_NOOWNERZORDER = 0x200, SWP_ASYNCWINDOWPOS = 0x4000;
@@ -2104,18 +2243,6 @@ namespace DocTabs
 
         [StructLayout(LayoutKind.Sequential)]
         public struct POINT { public int X, Y; }
-
-        public const int GUI_INMOVESIZE = 2, WM_KEYDOWN = 0x100, VK_RETURN = 0x0D;
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct GUITHREADINFO
-        {
-            public int cbSize, flags;
-            public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
-            public RECT rcCaret;
-        }
-
-        [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info);
 
         [StructLayout(LayoutKind.Sequential)]
         public struct WINDOWPLACEMENT
@@ -2150,7 +2277,6 @@ namespace DocTabs
         public const int WH_KEYBOARD_LL = 13, WH_MOUSE_LL = 14, WM_LBUTTONUP = 0x202, WM_SYSKEYDOWN = 0x104;
         public const int VK_LBUTTON = 1, VK_RBUTTON = 2;
         [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
-        [DllImport("user32.dll")] public static extern bool ReleaseCapture();
 
         [StructLayout(LayoutKind.Sequential)]
         public struct MSLLHOOKSTRUCT { public POINT pt; public uint mouseData, flags, time; public IntPtr extra; }
